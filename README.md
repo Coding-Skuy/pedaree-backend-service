@@ -53,3 +53,12 @@ DATABASE_URL=postgres://pedaree:pedaree@localhost:5432/pedaree cargo run
 
 Workflow `.github/workflows/ci.yml` menjalankan `cargo fmt --check`,
 `cargo clippy`, dan `cargo test`.
+
+## Dokumentasi API
+
+Kontrak REST v1 ditulis sebagai OpenAPI 3.1 di [`docs/api/openapi.yaml`](docs/api/openapi.yaml) dan dirender dengan Scalar di [`docs/api/index.html`](docs/api/index.html). Sisi produsen kontrak bilateral `pedaree.stok.v1` ke TitipO (`POST /sinyal/pedaree-stok`, anjuran saja) tercantum pada bagian `webhooks`.
+
+- Online (GitHub Pages): https://coding-skuy.github.io/pedaree-backend-service/api/
+- Lokal: `bun x serve docs/api` lalu buka alamat yang dicetak (mis. http://localhost:3000).
+- Validasi: `bun x @redocly/cli@latest lint docs/api/openapi.yaml`.
+- Kontrak hanya berubah lewat bump versi + ADR baru di `docs/decisions/`; sumbernya `produk/20`, `produk/21`, dan BRD `30-demand-metrik.md` di Pedaree-TownHall v1.0.0.

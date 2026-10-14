@@ -1,0 +1,1010 @@
+openapi: 3.1.0
+info:
+  title: API Pedaree — ChefGenie
+  version: 1.0.0
+  summary: Kontrak API Pedaree-Backend v1.0.0 (inventori dapur FEFO, kedaluwarsa, sinyal stok ke TitipO).
+  description: |
+    Kontrak API layanan `pedaree-backend-service` untuk divisi Pedaree (inventori dapur rumah
+    tangga: stok per batch, FEFO, SOP kedaluwarsa, metrik stockout dan waste, serta sinyal
+    anjuran restock ke TitipO).
+
+    Sumber kebenaran: `produk/20-kontrak-api-KMP-mobile.md`, `produk/21-kontrak-api-web-bun.md`,
+    `inventori/10-model-stok-dapur.md`, `inventori/20-satuan-hortikultura.md`,
+    `notifikasi/10-sop-kedaluwarsa.md`, `metrik/10-stockout-dan-waste.md`, dan
+    `platform/versions/v1.0.0/BRD/30-demand-metrik.md` di Pedaree-TownHall; kontrak bilateral
+    `pedaree.stok.v1` mengikuti KONTEKS-LINTAS-DIVISI.md §3.1.
+
+    **Aturan angka**
+    - Satuan hanya 13 kode baku (`inventori/20-satuan-hortikultura.md`): `gram`, `kg`, `ml`,
+      `liter`, `sdm`, `sdt`, `pcs`, `siung`, `buah`, `ikat`, `batang`, `bonggol`, `lembar`.
+      `kg` disimpan sebagai gram (x1000); `liter`, `sdm`, `sdt` disimpan sebagai ml
+      (x1000, x15, x5). Satuan hitung pecahan ditolak; jumlah di atas 50.000 g atau 50.000 ml
+      per batch ditolak.
+    - Waktu RFC3339 UTC; tanggal `YYYY-MM-DD`; ID entitas ULID (`itm_`, `btc_`, `hh_`).
+    - Uang (bila muncul) integer IDR; kontrak v1.0.0 tidak mengekspos nilai uang pada respons stok.
+
+    **FEFO.** Pengeluaran (`/pantry/consume`) selalu memotong batch dengan tanggal
+    kedaluwarsa terdekat lebih dulu (FIFO bila tanggal `null`). Batch `KEDALUWARSA` terkunci.
+
+    **Idempotensi.** Setiap `POST` membawa `X-Request-Id` (UUID). Server menyimpan hasil 24 jam;
+    kirim ulang dengan ID sama mengembalikan hasil asli tanpa mutasi ganda.
+
+    **Sinyal ke TitipO.** Pedaree adalah PRODUSEN kontrak bilateral `pedaree.stok.v1`; sisi
+    produsen didokumentasikan pada bagian `webhooks` (`sinyalPedareeStok`). Sinyal hanya
+    ANJURAN restock dan tidak pernah membuat pesanan otomatis.
+
+    **Autentikasi.** JWT akses 15 menit + refresh 7 hari (reuse-detection), audiens `pedaree`.
+    Web memakai cookie sesi `httpOnly`. Panggilan server-ke-server memakai `X-Service-Key`
+    (least-privilege).
+  license:
+    name: GNU AGPL v3.0 (lihat LICENSE repo)
+    identifier: AGPL-3.0-only
+  contact:
+    name: Tech Lead Pedaree
+    url: https://github.com/Coding-Skuy/Pedaree-TownHall
+servers:
+  - url: https://api.pedaree.chefgenie.id/v1
+    description: Produksi
+  - url: http://localhost:8080
+    description: Lokal (cargo run)
+tags:
+  - name: Sistem
+    description: Kesehatan layanan.
+  - name: Auth
+    description: Login dan refresh token (JWT audiens `pedaree`).
+  - name: Stok
+    description: Kartu bahan (PantryItem) dan batch stok.
+  - name: Mutasi
+    description: Pemakaian FEFO, opname, pindah lokasi, buang.
+  - name: Kedaluwarsa
+    description: Daftar batch yang mendekati atau melewati tanggal kedaluwarsa (SOP).
+  - name: Demand
+    description: Riwayat sinyal demand dan teruskan keranjang ke TitipO atas tindakan pengguna.
+  - name: Web
+    description: Endpoint khusus web pendamping (dasbor, impor/ekspor CSV, parcel TitipO).
+  - name: Integrasi
+    description: Sisi produsen kontrak bilateral `pedaree.stok.v1` ke TitipO.
+security:
+  - bearerAuth: []
+paths:
+  /kesehatan:
+    get:
+      tags: [Sistem]
+      operationId: kesehatan
+      summary: Cek kesehatan layanan
+      description: Mengembalikan status layanan dan nama basis data logis.
+      security: []
+      responses:
+        '200':
+          description: Layanan sehat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, db]
+                properties:
+                  status: { type: string, examples: [ok] }
+                  db: { type: string, examples: [pedaree] }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Masuk dan terima token akses + refresh
+      description: Mengembalikan JWT akses (15 menit) dan refresh (7 hari) dengan audiens `pedaree`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Token diterbitkan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPasangan' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: Tukar refresh token dengan pasangan token baru
+      description: |
+        Refresh token sekali pakai. Bila token lama dipakai ulang (reuse-detection), seluruh
+        keluarga refresh pengguna dicabut dan pengguna wajib login ulang (`401`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tokenRefresh]
+              properties:
+                tokenRefresh: { type: string }
+      responses:
+        '200':
+          description: Pasangan token baru.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPasangan' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '409': { $ref: '#/components/responses/Konflik' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/items:
+    get:
+      tags: [Stok]
+      operationId: daftarItem
+      summary: Daftar item dapur
+      description: Daftar ringkas item aktif dengan status stok dan batch terdekat kedaluwarsa. Paginasi kursor.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: q, in: query, description: "Cari nama bahan.", schema: { type: string } }
+        - { name: kategori, in: query, schema: { $ref: '#/components/schemas/Kategori' } }
+        - { name: statusStok, in: query, schema: { $ref: '#/components/schemas/StatusStok' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: cursor, in: query, description: "Kursor buram dari `nextCursor`.", schema: { type: string } }
+      responses:
+        '200':
+          description: Halaman item.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, nextCursor]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PantryItemRingkas' }
+                  nextCursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+    post:
+      tags: [Stok]
+      operationId: buatItem
+      summary: Buat kartu bahan baru
+      description: Satu bahan = satu kartu per rumah tangga. Unik `(householdId, lower(nama))` untuk item aktif; maksimum 400 item aktif per rumah tangga.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PantryItemBuat' }
+            example:
+              nama: Bawang Merah
+              kategori: BUMBU
+              satuanSimpan: gram
+              satuanTampil: gram
+              stokMinimum: 250
+              umurSimpanHariDefault: 21
+              lokasiDefault: BASKOM_BAWANG
+      responses:
+        '201':
+          description: Kartu dibuat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PantryItem' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '409': { $ref: '#/components/responses/Konflik' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/items/{id}:
+    get:
+      tags: [Stok]
+      operationId: detailItem
+      summary: Detail item beserta batch
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: id, in: path, required: true, schema: { type: string, examples: [itm_01J9Z8QK2M4A] } }
+      responses:
+        '200':
+          description: Item penuh.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PantryItemDetail' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/batches:
+    post:
+      tags: [Stok]
+      operationId: catatMasuk
+      summary: Catat masuk (belanja, panen, TitipO tiba, koreksi)
+      description: Membuat satu batch baru dan satu mutasi `MASUK`. Tanggal masuk tidak di masa depan dan boleh mundur maksimal 7 hari; tanggal kedaluwarsa tidak boleh sebelum tanggal masuk (kecuali umur simpan 0 yang memakai `null`).
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchBuat' }
+            example:
+              pantryItemId: itm_01J9Z8QK2M4A
+              jumlah: 1000
+              satuan: gram
+              tanggalMasuk: '2026-09-28'
+              tanggalKedaluwarsa: '2026-10-19'
+              lokasi: BASKOM_BAWANG
+              sumber: MASUK_BELANJA
+      responses:
+        '201':
+          description: Batch dan mutasi dibuat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StokBatch' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/consume:
+    post:
+      tags: [Mutasi]
+      operationId: catatPakai
+      summary: Catat pakai (FEFO di server)
+      description: |
+        Memotong `jumlahAktif` batch FEFO satu per satu sampai kebutuhan terpenuhi dan menulis
+        satu mutasi `PAKAI` per batch yang tersentuh. Batch `KEDALUWARSA` tidak bisa dipakai.
+        Bila stok kurang, respons tetap `200` dengan daftar `kurang`.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PemakaianRequest' }
+            example:
+              pemakaian:
+                - { pantryItemId: itm_01J9Z8QK2M4A, jumlah: 200, satuan: gram }
+              sumberResepId: null
+      responses:
+        '200':
+          description: Pemakaian dicatat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PemakaianHasil' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/opname:
+    post:
+      tags: [Mutasi]
+      operationId: opname
+      summary: Opname atau koreksi stok fisik
+      description: Selisih stok fisik terhadap catatan dibuatkan mutasi `KOREKSI` dengan alasan wajib. Koreksi negatif mengambil dari batch FEFO; koreksi positif membuat batch baru bersumber `MASUK_KOREKSI`. Konflik opname dijawab `409`.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpnameRequest' }
+            example: { pantryItemId: itm_01J9Z8QK2M4A, stokFisik: 650, satuan: gram, alasan: susut bayam }
+      responses:
+        '200':
+          description: Mutasi koreksi dicatat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mutasi]
+                properties:
+                  mutasi:
+                    type: array
+                    items: { $ref: '#/components/schemas/MutasiStok' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '409': { $ref: '#/components/responses/Konflik' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/batches/{id}/pindah:
+    post:
+      tags: [Mutasi]
+      operationId: pindahLokasi
+      summary: Pindah lokasi simpan batch
+      description: Menulis mutasi `PINDAH` (jumlah 0; lokasi lama ke baru di kolom alasan) dan memperbarui lokasi batch.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: id, in: path, required: true, schema: { type: string, examples: [btc_01J9Z8QK2M4C] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lokasiTujuan]
+              properties:
+                lokasiTujuan: { $ref: '#/components/schemas/LokasiSimpan' }
+      responses:
+        '200':
+          description: Batch dengan lokasi baru.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StokBatch' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/batches/{id}/buang:
+    post:
+      tags: [Mutasi]
+      operationId: buangBatch
+      summary: Buang batch kedaluwarsa atau rusak
+      description: Menulis mutasi `BUANG`; jumlah buang tidak boleh melebihi `jumlahAktif`. Batch berstatus `DIBUANG` bila sisa 0. Yang dibuang masuk metrik waste bulan berjalan.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: id, in: path, required: true, schema: { type: string, examples: [btc_01J9Z8QK2M4C] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BuangRequest' }
+            example: { jumlah: 150, satuan: gram, alasan: lewat tanggal }
+      responses:
+        '200':
+          description: Mutasi buang dicatat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MutasiStok' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /pantry/expiring:
+    get:
+      tags: [Kedaluwarsa]
+      operationId: daftarKedaluwarsa
+      summary: Batch mendekati kedaluwarsa (urut FEFO)
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: dalamHari, in: query, schema: { type: integer, minimum: 0, default: 7 } }
+      responses:
+        '200':
+          description: Daftar terurut tanggal kedaluwarsa terdekat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/BatchKedaluwarsa' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /demand/signals:
+    get:
+      tags: [Demand]
+      operationId: riwayatSinyal
+      summary: Riwayat sinyal demand yang pernah dipicu
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: sejak, in: query, description: "Waktu awal RFC3339 UTC.", schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: Daftar sinyal.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SinyalDemand' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /demand/titipo:
+    post:
+      tags: [Demand]
+      operationId: teruskanKeTitipo
+      summary: Teruskan keranjang ke TitipO (aksi pengguna)
+      description: Dipanggil hanya atas tindakan pengguna (`Tambah ke TitipO`). Bukan sinyal otomatis dan tidak membuat pesanan; TitipO yang memutuskan penawaran akhir.
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KeranjangTitipo' }
+            example:
+              items:
+                - { pantryItemId: itm_01J9Z8QK2M4A, jumlah: 500, satuan: gram }
+      responses:
+        '202':
+          description: Keranjang diterima untuk diteruskan.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, examples: [diterima] }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /web/dashboard:
+    get:
+      tags: [Web]
+      operationId: dasborWeb
+      summary: Ringkasan dasbor web (SSR)
+      description: Diakses SSR server-ke-server memakai service key, bukan token pengguna.
+      security:
+        - serviceKey: []
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: Ringkasan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DasborWeb' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /web/import/csv:
+    post:
+      tags: [Web]
+      operationId: imporCsv
+      summary: Impor stok dari CSV
+      description: 'Maksimal 200 baris dan 512 KB. Kolom: `nama,kategori,jumlah,satuan,tanggalMasuk,tanggalKedaluwarsa,lokasi`.'
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [berkas]
+              properties:
+                berkas: { type: string, format: binary }
+      responses:
+        '202':
+          description: Impor diterima; baris bermasalah dilaporkan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImporCsvHasil' }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '422': { $ref: '#/components/responses/TakTerproses' }
+        '429': { $ref: '#/components/responses/BatasLaju' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /web/export/csv:
+    get:
+      tags: [Web]
+      operationId: eksporStokCsv
+      summary: Ekspor stok tampil per item (CSV)
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: kategori, in: query, schema: { $ref: '#/components/schemas/Kategori' } }
+      responses:
+        '200':
+          description: Berkas `pedaree-stok-YYYYMMDD.csv`.
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /web/export/mutasi:
+    get:
+      tags: [Web]
+      operationId: eksporMutasiCsv
+      summary: Ekspor mutasi stok untuk audit (CSV)
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: dari, in: query, schema: { type: string, format: date } }
+        - { name: sampai, in: query, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: CSV mutasi.
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validasi' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /web/titipo/parcels:
+    get:
+      tags: [Web]
+      operationId: daftarParcelTitipo
+      summary: Parcel TitipO yang dapat dijadikan draf Catat Masuk
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: status, in: query, schema: { type: string, enum: [DITERIMA], default: DITERIMA } }
+      responses:
+        '200':
+          description: Daftar parcel.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ParcelTitipo' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+  /web/titipo/parcels/{id}/draft-masuk:
+    post:
+      tags: [Web]
+      operationId: draftMasukDariParcel
+      summary: Buat draf Catat Masuk dari parcel TitipO
+      description: Menghasilkan draf batch yang dapat disimpan atau dikoreksi pengguna; draf belum mengubah stok.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/XHouseholdId'
+        - $ref: '#/components/parameters/XRequestId'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '201':
+          description: Draf dibuat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [draf]
+                properties:
+                  draf:
+                    type: array
+                    items: { $ref: '#/components/schemas/DrafMasukItem' }
+        '401': { $ref: '#/components/responses/TidakSah' }
+        '404': { $ref: '#/components/responses/TidakAda' }
+        '409': { $ref: '#/components/responses/Konflik' }
+        '500': { $ref: '#/components/responses/GalatServer' }
+webhooks:
+  sinyalPedareeStok:
+    post:
+      tags: [Integrasi]
+      operationId: kirimSinyalPedareeStok
+      summary: Kirim sinyal stok ke TitipO (pedaree.stok.v1) — sisi produsen
+      description: |
+        Permintaan KELUAR yang diterbitkan Pedaree (PRODUSEN) ke penerima TitipO
+        `POST /sinyal/pedaree-stok` (lihat `titipo-backend-service/docs/api/openapi.yaml`).
+        Kontrak bilateral terkunci 2026-10-07 (KONTEKS §3.1); bukan bagian registry 11 event Titeny.
+
+        - **Jenis terkunci (3):** `stok.menipis`, `stok.habis`, `kedaluwarsa.dekat`.
+        - **Pemicu + dedup produsen:** transisi ke menipis dan ke habis, serta kedaluwarsa dekat;
+          maksimal **1 sinyal per item per 24 jam** (BR-301).
+        - **Payload wajib:** `item`, `sisa`, `satuan` (13 baku), `kedaluwarsa`, `recipe_id` Pawonee
+          (boleh kosong), ditambah `jenis`, `item_id`, `tanggal` (kunci idempoten konsumen).
+        - **Header:** `X-Service-Key` (service key least-privilege milik Pedaree).
+        - **Respons penerima:** `201 {"status":"dicatat_sebagai_anjuran"}`; duplikat
+          (`item_id + tanggal`) `200 {"status":"duplikat_diabaikan"}` bukan galat; `422
+          JENIS_SINYAL_TIDAK_DIKENAL` untuk jenis di luar tiga.
+        - **Sifat:** anjuran restock saja — TIDAK PERNAH membuat pesanan otomatis; relevansi 48 jam.
+        - **Kegagalan:** retry 3x (5/30/300 detik) lalu DLQ.
+      security:
+        - serviceKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SinyalPedareeStok' }
+            example:
+              jenis: stok.menipis
+              item_id: itm_01J9Z8QK2M4A
+              tanggal: '2026-10-14'
+              item: Cabai merah
+              sisa: 150
+              satuan: gram
+              kedaluwarsa: '2026-10-17'
+              recipe_id: null
+      responses:
+        '200':
+          description: Penerima menjawab duplikat diabaikan.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: duplikat_diabaikan }
+        '201':
+          description: Penerima mencatat sebagai anjuran restock.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: dicatat_sebagai_anjuran }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT akses 15 menit, audiens `pedaree`.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: pedaree_sess
+      description: Cookie sesi `httpOnly` untuk web pendamping.
+    serviceKey:
+      type: apiKey
+      in: header
+      name: X-Service-Key
+      description: Service key server-ke-server (least-privilege). Pada sinyal keluar ke TitipO, hanya berhak mengirim `pedaree.stok.v1`.
+  parameters:
+    XHouseholdId:
+      name: X-Household-Id
+      in: header
+      required: true
+      description: ID rumah tangga pemilik data (`hh_` + ULID).
+      schema: { type: string, examples: [hh_01J9Z8QK2M4B] }
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      description: UUID per permintaan; hasil POST disimpan 24 jam untuk idempotensi.
+      schema: { type: string, format: uuid }
+  responses:
+    Validasi:
+      description: 400 — permintaan tidak valid (format atau field salah).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+          example: { kode: VALIDASI_GAGAL, pesan: Field jumlah wajib diisi, field: jumlah }
+    TidakSah:
+      description: 401 — token atau sesi tidak sah atau audiens bukan `pedaree`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+          example: { kode: TIDAK_SAH, pesan: Token tidak sah }
+    TidakAda:
+      description: 404 — sumber daya tidak ditemukan.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+          example: { kode: TIDAK_ADA, pesan: Item tidak ditemukan }
+    Konflik:
+      description: 409 — konflik (nama item ganda, konflik opname, refresh token dipakai ulang).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+          example: { kode: KONFLIK, pesan: Item dengan nama ini sudah ada }
+    TakTerproses:
+      description: 422 — aturan domain dilanggar (stok habis, satuan tidak berlaku, jumlah di atas 50.000 g/ml, batch kedaluwarsa).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+          example: { kode: SATUAN_TIDAK_BERLAKU, pesan: satuan tidak berlaku untuk komoditas ini, field: satuan }
+    BatasLaju:
+      description: 429 — melebihi batas laju (mobile 60 permintaan/menit per token; web 120 permintaan/menit per sesi).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+    GalatServer:
+      description: 500 — galat internal.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AppError' }
+  schemas:
+    AppError:
+      type: object
+      description: Galat baku (`AppError`).
+      required: [kode, pesan]
+      properties:
+        kode:
+          type: string
+          description: Kode galat mesin.
+          examples: [STOK_KURANG]
+        pesan: { type: string, examples: [Stok tomat kurang 200 g] }
+        field: { type: [string, 'null'], examples: [jumlah] }
+    Satuan:
+      type: string
+      description: 13 satuan baku (sumber sah `inventori/20-satuan-hortikultura.md`).
+      enum: [gram, kg, ml, liter, sdm, sdt, pcs, siung, buah, ikat, batang, bonggol, lembar]
+    Kategori:
+      type: string
+      enum: [SAYUR, BUMBU, BUAH, PROTEIN, KERING, CAIR, BEKU, SISA]
+    LokasiSimpan:
+      type: string
+      enum: [KULKAS_BAWAH, KULKAS_ATAS, FREEZER, SUHU_RUANG, BASKOM_BAWANG]
+    SumberBatch:
+      type: string
+      enum: [MASUK_BELANJA, MASUK_PANEN, MASUK_TITIPO, MASUK_KOREKSI]
+    StatusBatch:
+      type: string
+      enum: [AKTIF, HABIS, KEDALUWARSA, DIBUANG]
+    StatusStok:
+      type: string
+      enum: [AMAN, MENIPIS, HABIS]
+    StatusKedaluwarsa:
+      type: string
+      description: Ambang SOP dari selisih hari kalender. AMAN lebih dari 7 hari; WASPADA 4–7; SEGERA 1–3; HARI_INI 0; KEDALUWARSA kurang dari 0.
+      enum: [AMAN, WASPADA, SEGERA, HARI_INI, KEDALUWARSA]
+    JenisMutasi:
+      type: string
+      enum: [PAKAI, MASUK, KOREKSI, PINDAH, BUANG]
+    AlasanBuang:
+      type: string
+      enum: [busuk, berlendir/berbau, lewat tanggal, tercemar]
+    LoginRequest:
+      type: object
+      required: [idPengguna, kataSandi]
+      properties:
+        idPengguna: { type: string }
+        kataSandi: { type: string, format: password, writeOnly: true }
+        idPerangkat: { type: string, description: Id perangkat terdaftar (opsional). }
+    TokenPasangan:
+      type: object
+      required: [tokenAkses, tokenRefresh, kedaluwarsaDetik, audiens]
+      properties:
+        tokenAkses: { type: string, description: "JWT akses, umur 15 menit." }
+        tokenRefresh: { type: string, description: "Refresh token, umur 7 hari, sekali pakai." }
+        kedaluwarsaDetik: { type: integer, const: 900 }
+        audiens: { type: string, const: pedaree }
+    PantryItemBuat:
+      type: object
+      required: [nama, kategori, satuanSimpan, satuanTampil, stokMinimum, umurSimpanHariDefault, lokasiDefault]
+      properties:
+        nama: { type: string, minLength: 3, maxLength: 60 }
+        kategori: { $ref: '#/components/schemas/Kategori' }
+        satuanSimpan: { $ref: '#/components/schemas/Satuan' }
+        satuanTampil: { $ref: '#/components/schemas/Satuan' }
+        stokMinimum: { type: number, minimum: 0 }
+        umurSimpanHariDefault: { type: integer, minimum: 0, maximum: 365, description: "0 berarti tidak mudah busuk (garam, gula)." }
+        lokasiDefault: { $ref: '#/components/schemas/LokasiSimpan' }
+        fotoUrl: { type: [string, 'null'], format: uri }
+    PantryItem:
+      type: object
+      required: [id, householdId, nama, kategori, satuanSimpan, satuanTampil, stokMinimum, umurSimpanHariDefault, lokasiDefault, arsip, dibuatPada, diubahPada]
+      properties:
+        id: { type: string, examples: [itm_01J9Z8QK2M4A] }
+        householdId: { type: string, examples: [hh_01J9Z8QK2M4B] }
+        nama: { type: string, minLength: 3, maxLength: 60 }
+        kategori: { $ref: '#/components/schemas/Kategori' }
+        satuanSimpan: { $ref: '#/components/schemas/Satuan' }
+        satuanTampil: { $ref: '#/components/schemas/Satuan' }
+        stokMinimum: { type: number, minimum: 0 }
+        umurSimpanHariDefault: { type: integer, minimum: 0, maximum: 365 }
+        lokasiDefault: { $ref: '#/components/schemas/LokasiSimpan' }
+        fotoUrl: { type: [string, 'null'], format: uri }
+        arsip: { type: boolean }
+        dibuatPada: { type: string, format: date-time }
+        diubahPada: { type: string, format: date-time }
+    PantryItemRingkas:
+      type: object
+      required: [id, nama, kategori, stokTampil, satuanTampil, statusStok, lokasiDefault]
+      properties:
+        id: { type: string }
+        nama: { type: string }
+        kategori: { $ref: '#/components/schemas/Kategori' }
+        stokTampil: { type: number, minimum: 0, description: "Jumlah semua batch AKTIF; 1 desimal untuk gram/ml, bilangan bulat untuk satuan hitung." }
+        satuanTampil: { $ref: '#/components/schemas/Satuan' }
+        statusStok: { $ref: '#/components/schemas/StatusStok' }
+        batchTerdekatKedaluwarsa: { type: [string, 'null'], format: date }
+        lokasiDefault: { $ref: '#/components/schemas/LokasiSimpan' }
+    PantryItemDetail:
+      allOf:
+        - $ref: '#/components/schemas/PantryItem'
+        - type: object
+          required: [batches, stokTampil]
+          properties:
+            stokTampil: { type: number, minimum: 0 }
+            batches:
+              type: array
+              items: { $ref: '#/components/schemas/StokBatch' }
+    BatchBuat:
+      type: object
+      required: [pantryItemId, jumlah, satuan, tanggalMasuk, lokasi, sumber]
+      properties:
+        pantryItemId: { type: string }
+        jumlah: { type: number, exclusiveMinimum: 0 }
+        satuan: { $ref: '#/components/schemas/Satuan' }
+        tanggalMasuk: { type: string, format: date }
+        tanggalKedaluwarsa: { type: [string, 'null'], format: date, description: "Default tanggal masuk + umurSimpanHariDefault; null hanya bila umur simpan 0." }
+        lokasi: { $ref: '#/components/schemas/LokasiSimpan' }
+        sumber: { $ref: '#/components/schemas/SumberBatch' }
+    StokBatch:
+      type: object
+      required: [id, pantryItemId, jumlahAwal, jumlahAktif, tanggalMasuk, tanggalKedaluwarsa, lokasi, sumber, status, dibuatPada]
+      properties:
+        id: { type: string, examples: [btc_01J9Z8QK2M4C] }
+        pantryItemId: { type: string }
+        jumlahAwal: { type: number, exclusiveMinimum: 0, description: Dalam satuanSimpan. }
+        jumlahAktif: { type: number, minimum: 0 }
+        tanggalMasuk: { type: string, format: date }
+        tanggalKedaluwarsa: { type: [string, 'null'], format: date }
+        lokasi: { $ref: '#/components/schemas/LokasiSimpan' }
+        sumber: { $ref: '#/components/schemas/SumberBatch' }
+        status: { $ref: '#/components/schemas/StatusBatch' }
+        dibuatPada: { type: string, format: date-time }
+    MutasiStok:
+      type: object
+      required: [id, batchId, jenis, jumlah, sisaSetelah, alasan, aktor, terjadiPada]
+      properties:
+        id: { type: string }
+        batchId: { type: string }
+        jenis: { $ref: '#/components/schemas/JenisMutasi' }
+        jumlah: { type: number, description: "Positif masuk, negatif keluar; dalam satuanSimpan." }
+        sisaSetelah: { type: number, minimum: 0 }
+        alasan: { type: string, minLength: 3, maxLength: 140 }
+        aktor: { type: string, description: userId pencatat. }
+        terjadiPada: { type: string, format: date-time }
+    PemakaianRequest:
+      type: object
+      required: [pemakaian]
+      properties:
+        pemakaian:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [pantryItemId, jumlah, satuan]
+            properties:
+              pantryItemId: { type: string }
+              jumlah: { type: number, exclusiveMinimum: 0 }
+              satuan: { $ref: '#/components/schemas/Satuan' }
+        sumberResepId: { type: [string, 'null'], description: ID resep Pawonee bila dari tombol `Masak ini`. }
+    PemakaianHasil:
+      type: object
+      required: [terpotong, kurang]
+      properties:
+        terpotong:
+          type: array
+          items:
+            type: object
+            required: [batchId, jumlah]
+            properties:
+              batchId: { type: string }
+              jumlah: { type: number, exclusiveMinimum: 0 }
+        kurang:
+          type: array
+          items:
+            type: object
+            required: [pantryItemId, kurangJumlah, satuanSimpan]
+            properties:
+              pantryItemId: { type: string }
+              kurangJumlah: { type: number, exclusiveMinimum: 0 }
+              satuanSimpan: { $ref: '#/components/schemas/Satuan' }
+    OpnameRequest:
+      type: object
+      required: [pantryItemId, stokFisik, satuan, alasan]
+      properties:
+        pantryItemId: { type: string }
+        stokFisik: { type: number, minimum: 0 }
+        satuan: { $ref: '#/components/schemas/Satuan' }
+        alasan: { type: string, minLength: 3, maxLength: 140 }
+    BuangRequest:
+      type: object
+      required: [jumlah, satuan, alasan]
+      properties:
+        jumlah: { type: number, exclusiveMinimum: 0 }
+        satuan: { $ref: '#/components/schemas/Satuan' }
+        alasan: { $ref: '#/components/schemas/AlasanBuang' }
+    BatchKedaluwarsa:
+      type: object
+      required: [batchId, pantryItemId, nama, sisa, satuanTampil, tanggalKedaluwarsa, status]
+      properties:
+        batchId: { type: string }
+        pantryItemId: { type: string }
+        nama: { type: string }
+        sisa: { type: number, minimum: 0 }
+        satuanTampil: { $ref: '#/components/schemas/Satuan' }
+        tanggalKedaluwarsa: { type: string, format: date }
+        status: { $ref: '#/components/schemas/StatusKedaluwarsa' }
+    SinyalDemand:
+      type: object
+      required: [itemId, jenis, dipicuPada, statusKirimTitipO]
+      properties:
+        itemId: { type: string }
+        jenis: { $ref: '#/components/schemas/JenisSinyal' }
+        dipicuPada: { type: string, format: date-time }
+        statusKirimTitipO: { type: string, enum: [TERKIRIM, ANTRE] }
+    JenisSinyal:
+      type: string
+      description: 3 jenis terkunci kontrak `pedaree.stok.v1`.
+      enum: [stok.menipis, stok.habis, kedaluwarsa.dekat]
+    KeranjangTitipo:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [pantryItemId, jumlah, satuan]
+            properties:
+              pantryItemId: { type: string }
+              jumlah: { type: number, exclusiveMinimum: 0 }
+              satuan: { $ref: '#/components/schemas/Satuan' }
+    SinyalPedareeStok:
+      type: object
+      description: Payload kontrak bilateral `pedaree.stok.v1` (identik dengan skema penerima TitipO).
+      required: [jenis, item_id, tanggal, item, sisa, satuan, kedaluwarsa]
+      properties:
+        jenis: { $ref: '#/components/schemas/JenisSinyal' }
+        item_id: { type: string, description: Bagian pertama kunci idempoten konsumen. }
+        tanggal: { type: string, format: date, description: Bagian kedua kunci idempoten (`item_id + tanggal`). }
+        item: { type: string, description: Nama bahan. }
+        sisa: { type: number, minimum: 0 }
+        satuan: { $ref: '#/components/schemas/Satuan' }
+        kedaluwarsa: { type: string, format: date }
+        recipe_id: { type: [string, 'null'], description: "ID resep Pawonee; boleh kosong; hanya rujukan tampilan." }
+    DasborWeb:
+      type: object
+      required: [totalItemAktif, menipis, habis, segeraKedaluwarsa3Hari, wasteBulanGram, sinyalTerkirim7Hari]
+      properties:
+        totalItemAktif: { type: integer, minimum: 0 }
+        menipis: { type: integer, minimum: 0 }
+        habis: { type: integer, minimum: 0 }
+        segeraKedaluwarsa3Hari: { type: integer, minimum: 0 }
+        wasteBulanGram: { type: number, minimum: 0, description: Waste bulan berjalan dalam gram (target kurang dari 1.500 g per rumah tangga per bulan). }
+        sinyalTerkirim7Hari: { type: integer, minimum: 0 }
+    ImporCsvHasil:
+      type: object
+      required: [diterima, ditolak, galatBaris]
+      properties:
+        diterima: { type: integer, minimum: 0 }
+        ditolak: { type: integer, minimum: 0 }
+        galatBaris:
+          type: array
+          items:
+            type: object
+            required: [baris, pesan]
+            properties:
+              baris: { type: integer, minimum: 1 }
+              pesan: { type: string, examples: [satuan tidak berlaku] }
+    ParcelTitipo:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [DITERIMA] }
+    DrafMasukItem:
+      type: object
+      required: [pantryItemId, jumlah, satuan]
+      properties:
+        pantryItemId: { type: string }
+        jumlah: { type: number, exclusiveMinimum: 0 }
+        satuan: { $ref: '#/components/schemas/Satuan' }
